@@ -90,6 +90,11 @@ pub struct TargetHTTPOptions {
 
     #[serde(default)]
     pub external_host: Option<String>,
+
+    /// Forward unauthenticated browser CORS preflight requests to this target.
+    /// Requires `external_host`; the target remains responsible for its CORS policy.
+    #[serde(default)]
+    pub forward_cors_preflight: bool,
 }
 
 // `#[serde(default)]` sits on the container, not on each field, so that
@@ -551,6 +556,17 @@ mod tests {
         assert!(absent.tls.verify);
         assert_eq!(absent.tls, empty.tls);
         assert_eq!(absent.tls, Tls::default());
+        assert!(!absent.forward_cors_preflight);
+    }
+
+    #[test]
+    fn cors_preflight_forwarding_is_opt_in() {
+        let enabled: TargetHTTPOptions = serde_json::from_str(
+            r#"{"url":"http://t","external_host":"api.example.com","forward_cors_preflight":true}"#,
+        )
+        .unwrap();
+
+        assert!(enabled.forward_cors_preflight);
     }
 
     #[test]

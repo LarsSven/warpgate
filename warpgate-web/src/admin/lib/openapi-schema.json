@@ -6799,7 +6799,8 @@
         "title": "TargetHTTPOptions",
         "required": [
           "url",
-          "tls"
+          "tls",
+          "forward_cors_preflight"
         ],
         "properties": {
           "url": {
@@ -6816,6 +6817,10 @@
           },
           "external_host": {
             "type": "string"
+          },
+          "forward_cors_preflight": {
+            "type": "boolean",
+            "description": "Forward unauthenticated browser CORS preflight requests to this target.\nRequires `external_host`; the target remains responsible for its CORS policy."
           }
         }
       },
