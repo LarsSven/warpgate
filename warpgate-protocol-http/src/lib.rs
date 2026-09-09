@@ -298,12 +298,14 @@ impl ProtocolServer for HTTPProtocolServer {
             .nest("/_warpgate", at_warpgate_endpoints())
             .nest_no_strip(
                 "/",
-                page_auth(catchall::catchall_endpoint).around(move |ep, req| async move {
-                    Ok(match Box::pin(ep.call(req)).await {
-                        Ok(response) => response.into_response(),
-                        Err(ref error) => error_page(error).into_response(),
-                    })
-                }),
+                page_auth(catchall::catchall_endpoint)
+                    .around(middleware::cors::forward)
+                    .around(move |ep, req| async move {
+                        Ok(match Box::pin(ep.call(req)).await {
+                            Ok(response) => response.into_response(),
+                            Err(ref error) => error_page(error).into_response(),
+                        })
+                    }),
             )
             .around(inject_request_authorization)
             .around(move |ep, req| async move {

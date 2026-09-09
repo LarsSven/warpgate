@@ -1,4 +1,5 @@
 mod cookie_host;
+pub(crate) mod cors;
 mod mfa_enforcement;
 mod security_headers;
 pub(crate) mod ticket;

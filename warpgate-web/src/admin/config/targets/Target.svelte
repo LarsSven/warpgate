@@ -277,6 +277,26 @@
                                         bind:value={target.options.externalHost}
                                     />
                                 </FormGroup>
+
+                                <label
+                                    for="forwardCorsPreflight"
+                                    class="d-flex align-items-start"
+                                >
+                                    <Input
+                                        id="forwardCorsPreflight"
+                                        class="mb-0 me-2"
+                                        type="switch"
+                                        bind:checked={target.options.forwardCorsPreflight}
+                                    />
+                                    <div>
+                                        Forward unauthenticated CORS preflight
+                                        requests
+                                        <div class="form-text mt-0">
+                                            The target must validate allowed
+                                            origins, methods, and headers.
+                                        </div>
+                                    </div>
+                                </label>
                             {/if}
 
                             <h4 class="mt-4">Additional headers</h4>

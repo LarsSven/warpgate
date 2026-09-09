@@ -315,6 +315,7 @@ mod tests {
                 tls: Tls::default(),
                 headers: None,
                 external_host: None,
+                forward_cors_preflight: false,
             }),
             rate_limit_bytes_per_second: None,
             group_id: None,

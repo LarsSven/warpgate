@@ -40,6 +40,7 @@
                 Http: {
                     kind: TargetKind.Http,
                     url: 'http://192.168.0.1',
+                    forwardCorsPreflight: false,
                     tls: {
                         mode: TlsMode.Preferred,
                         verify: true,

@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cookie::Cookie;
@@ -23,6 +24,7 @@ use warpgate_common::http_headers::{
     X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO, may_forward_header,
 };
 use warpgate_common::{TargetHTTPOptions, WarpgateError, try_block};
+use warpgate_common_http::auth::UnauthenticatedRequestContext;
 use warpgate_common_http::logging::{get_client_ip, log_request_result};
 use warpgate_common_http::{
     AuthenticatedRequestContext, SessionAuthorization, SessionKeepalive, SessionKeepaliveGuard,
@@ -287,7 +289,7 @@ fn copy_server_request<B: SomeRequestBuilder>(req: &Request, mut target: B) -> R
 
 fn inject_forwarding_headers<B: SomeRequestBuilder>(
     req: &Request,
-    ctx: &AuthenticatedRequestContext,
+    ctx: &UnauthenticatedRequestContext,
     mut target: B,
 ) -> B {
     if let Some(host) = ctx.trusted_host_header(req) {
@@ -298,6 +300,82 @@ fn inject_forwarding_headers<B: SomeRequestBuilder>(
         target = target.header(X_FORWARDED_FOR.clone(), addr.ip().to_string());
     }
     target
+}
+
+/// Forward a browser CORS preflight without carrying credentials across the
+/// unauthenticated boundary. The target owns the CORS decision; Warpgate only
+/// returns response metadata needed by the browser and discards any body.
+pub async fn proxy_cors_preflight(
+    req: &Request,
+    ctx: &UnauthenticatedRequestContext,
+    client_cache: &HttpClientCache,
+    target_name: &str,
+    options: &TargetHTTPOptions,
+) -> poem::Result<Response> {
+    let (_, uri) = extract_basic_auth(construct_uri(req, options, false)?)?;
+    let client = client_cache
+        .preflight_client_for(target_name, options)
+        .await?;
+    let mut client_request = client
+        .request(http::Method::OPTIONS, uri.to_string())
+        .timeout(Duration::from_secs(10));
+
+    // These are the only request headers an application needs to decide a
+    // preflight. In particular, do not forward Cookie, Authorization, target
+    // URL credentials, target-configured headers, or x-warpgate-* headers.
+    client_request = client_request.headers(cors_preflight_request_headers(req));
+    client_request = inject_forwarding_headers(req, ctx, client_request);
+
+    let client_response = client_request
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("Could not execute CORS preflight: {error}"))?;
+    let status = client_response.status();
+    let response = cors_preflight_response(status, client_response.headers());
+
+    log_request_result(
+        req.method(),
+        req.original_uri(),
+        get_client_ip(req, ctx.services()).await.as_deref(),
+        status,
+    );
+    Ok(response)
+}
+
+fn cors_preflight_request_headers(req: &Request) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    for name in [
+        http::header::ORIGIN,
+        http::header::ACCESS_CONTROL_REQUEST_METHOD,
+        http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+        HeaderName::from_static("access-control-request-private-network"),
+    ] {
+        for value in req.headers().get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
+fn cors_preflight_response(status: StatusCode, source: &http::HeaderMap) -> Response {
+    let mut response = Response::builder().status(status).finish();
+
+    // Do not expose arbitrary headers, Set-Cookie, or a response body through
+    // this unauthenticated path. The backend's CORS metadata remains intact.
+    for name in [
+        http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        http::header::ACCESS_CONTROL_MAX_AGE,
+        http::header::VARY,
+        HeaderName::from_static("access-control-allow-private-network"),
+    ] {
+        for value in source.get_all(&name) {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    response
 }
 
 async fn inject_own_headers<B: SomeRequestBuilder>(req: &Request, mut target: B) -> Result<B> {
@@ -656,6 +734,58 @@ async fn proxy_ws_inner(
 mod tests {
     use super::*;
 
+    #[test]
+    fn preflight_request_forwards_only_cors_metadata() {
+        let request = Request::builder()
+            .header(http::header::ORIGIN, "https://frontend.example")
+            .header(http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(http::header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .header("access-control-request-private-network", "true")
+            .header(http::header::COOKIE, "warpgate-http-session=secret")
+            .header(http::header::AUTHORIZATION, "Bearer secret")
+            .header("x-warpgate-token", "secret")
+            .finish();
+
+        let headers = cors_preflight_request_headers(&request);
+        assert_eq!(headers.len(), 4);
+        assert_eq!(headers[http::header::ORIGIN], "https://frontend.example");
+        assert_eq!(headers[http::header::ACCESS_CONTROL_REQUEST_METHOD], "POST");
+        assert!(!headers.contains_key(http::header::COOKIE));
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-warpgate-token"));
+    }
+
+    #[tokio::test]
+    async fn preflight_response_exposes_only_cors_metadata() {
+        let mut source = http::HeaderMap::new();
+        source.insert(
+            http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://frontend.example"),
+        );
+        source.insert(
+            http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+        source.insert(
+            http::header::SET_COOKIE,
+            HeaderValue::from_static("session=secret"),
+        );
+        source.insert(
+            http::header::LOCATION,
+            HeaderValue::from_static("https://internal.example/secret"),
+        );
+
+        let response = cors_preflight_response(StatusCode::NO_CONTENT, &source);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://frontend.example"
+        );
+        assert!(!response.headers().contains_key(http::header::SET_COOKIE));
+        assert!(!response.headers().contains_key(http::header::LOCATION));
+        assert!(response.into_body().into_bytes().await.unwrap().is_empty());
+    }
+
     fn forwarded_cookie_header(values: &[&str]) -> Option<String> {
         let mut request = Request::builder();
         for value in values {
@@ -702,6 +832,7 @@ mod tests {
             tls: Default::default(),
             headers: None,
             external_host: None,
+            forward_cors_preflight: false,
         }
     }
 

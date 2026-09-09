@@ -34,6 +34,7 @@ impl From<&TargetHTTPOptions> for ClientConfiguration {
 struct CachedClient {
     configuration: ClientConfiguration,
     client: reqwest::Client,
+    preflight_client: Option<reqwest::Client>,
     last_used: Instant,
 }
 
@@ -80,7 +81,7 @@ impl HttpClientCache {
             }
         }
 
-        let client = build_client(&configuration)?;
+        let client = build_client(&configuration, true)?;
         #[cfg(test)]
         self.build_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -90,11 +91,50 @@ impl HttpClientCache {
             CachedClient {
                 configuration,
                 client: client.clone(),
+                preflight_client: None,
                 last_used: now,
             },
         );
 
         Ok(client)
+    }
+
+    /// A target client that never follows redirects. Preflights are forwarded
+    /// without authentication, so following them to another origin would cross
+    /// the target boundary established by `external_host`.
+    pub async fn preflight_client_for(
+        &self,
+        target_name: &str,
+        options: &TargetHTTPOptions,
+    ) -> Result<reqwest::Client> {
+        loop {
+            // Ensure the cache contains the current configuration. This keeps
+            // the normal and preflight clients invalidated together.
+            self.client_for(target_name, options).await?;
+            let configuration = ClientConfiguration::from(options);
+            {
+                let mut clients = self.clients.lock().await;
+                if let Some(entry) = clients.get_mut(target_name)
+                    && entry.configuration == configuration
+                {
+                    entry.last_used = Instant::now();
+                    if let Some(client) = &entry.preflight_client {
+                        return Ok(client.clone());
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            let client = build_client(&configuration, false)?;
+            let mut clients = self.clients.lock().await;
+            if let Some(entry) = clients.get_mut(target_name)
+                && entry.configuration == configuration
+            {
+                let client = entry.preflight_client.get_or_insert(client);
+                return Ok(client.clone());
+            }
+        }
     }
 
     pub async fn vacuum(&self) {
@@ -106,7 +146,10 @@ impl HttpClientCache {
     }
 }
 
-fn build_client(configuration: &ClientConfiguration) -> Result<reqwest::Client> {
+fn build_client(
+    configuration: &ClientConfiguration,
+    follow_http_upgrade: bool,
+) -> Result<reqwest::Client> {
     let tls_mode = configuration.tls_mode;
     let mut client = reqwest::Client::builder()
         .gzip(true)
@@ -119,7 +162,8 @@ fn build_client(configuration: &ClientConfiguration) -> Result<reqwest::Client> 
                 .first()
                 .is_some_and(|url| url.scheme() == "http");
 
-            if tls_mode == TlsMode::Preferred
+            if follow_http_upgrade
+                && tls_mode == TlsMode::Preferred
                 && started_with_http
                 && attempt.url().scheme() == "https"
             {
@@ -155,6 +199,7 @@ mod tests {
             tls: Default::default(),
             headers: None,
             external_host: None,
+            forward_cors_preflight: false,
         }
     }
 
@@ -167,6 +212,28 @@ mod tests {
         cache.client_for("target", &options).await.unwrap();
         cache.client_for("target", &options).await.unwrap();
 
+        assert_eq!(
+            cache.build_count.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reuses_redirect_free_preflight_client() {
+        install_crypto_provider();
+        let cache = HttpClientCache::default();
+        let options = make_options("https://example.com");
+
+        cache
+            .preflight_client_for("target", &options)
+            .await
+            .unwrap();
+        cache
+            .preflight_client_for("target", &options)
+            .await
+            .unwrap();
+
+        // The counter tracks cache configurations, not the two client modes.
         assert_eq!(
             cache.build_count.load(std::sync::atomic::Ordering::Relaxed),
             1
