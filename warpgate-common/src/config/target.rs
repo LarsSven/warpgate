@@ -94,6 +94,7 @@ pub struct TargetHTTPOptions {
     /// Forward unauthenticated browser CORS preflight requests to this target.
     /// Requires `external_host`; the target remains responsible for its CORS policy.
     #[serde(default)]
+    #[oai(default)]
     pub forward_cors_preflight: bool,
 }
 
@@ -543,6 +544,8 @@ pub fn redact_target_secrets(value: &mut serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+    use poem_openapi::types::ParseFromJSON;
+
     use super::{TargetHTTPOptions, TargetKubernetesOptions, TargetMySqlOptions, Tls};
 
     /// The two ways of saying "nothing specified" — an absent `tls` block and an
@@ -567,6 +570,24 @@ mod tests {
         .unwrap();
 
         assert!(enabled.forward_cors_preflight);
+    }
+
+    #[test]
+    fn openapi_defaults_null_or_missing_cors_preflight_to_false() {
+        for options in [
+            serde_json::json!({
+                "url": "http://t",
+                "tls": {"mode": "Preferred", "verify": true},
+                "forward_cors_preflight": null
+            }),
+            serde_json::json!({
+                "url": "http://t",
+                "tls": {"mode": "Preferred", "verify": true}
+            }),
+        ] {
+            let options = TargetHTTPOptions::parse_from_json(Some(options)).unwrap();
+            assert!(!options.forward_cors_preflight);
+        }
     }
 
     #[test]

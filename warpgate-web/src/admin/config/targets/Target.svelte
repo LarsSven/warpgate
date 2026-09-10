@@ -60,6 +60,9 @@
         if (target.options.kind === 'Postgres') {
             target.options.protocolVersion ??= '3.2'
         }
+        if (target.options.kind === 'Http') {
+            target.options.forwardCorsPreflight ??= false
+        }
         return target
     }
 
