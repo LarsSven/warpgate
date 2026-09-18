@@ -302,9 +302,9 @@ fn inject_forwarding_headers<B: SomeRequestBuilder>(
     target
 }
 
-/// Forward a browser CORS preflight without carrying credentials across the
-/// unauthenticated boundary. The target owns the CORS decision; Warpgate only
-/// returns response metadata needed by the browser and discards any body.
+/// Forward a browser CORS preflight without carrying client credentials across
+/// the unauthenticated boundary. The target owns the CORS decision; Warpgate
+/// only returns response metadata needed by the browser and discards any body.
 pub async fn proxy_cors_preflight(
     req: &Request,
     ctx: &UnauthenticatedRequestContext,
@@ -320,11 +320,12 @@ pub async fn proxy_cors_preflight(
         .request(http::Method::OPTIONS, uri.to_string())
         .timeout(Duration::from_secs(10));
 
-    // These are the only request headers an application needs to decide a
-    // preflight. In particular, do not forward Cookie, Authorization, target
-    // URL credentials, target-configured headers, or x-warpgate-* headers.
+    // Only browser CORS metadata crosses from the unauthenticated request.
+    // Apply administrator-configured headers after forwarding metadata, as for
+    // normal requests. These may include credentials, so target opt-in matters.
     client_request = client_request.headers(cors_preflight_request_headers(req));
     client_request = inject_forwarding_headers(req, ctx, client_request);
+    client_request = rewrite_request(client_request, options)?;
 
     let client_response = client_request
         .send()
@@ -753,6 +754,63 @@ mod tests {
         assert!(!headers.contains_key(http::header::COOKIE));
         assert!(!headers.contains_key(http::header::AUTHORIZATION));
         assert!(!headers.contains_key("x-warpgate-token"));
+    }
+
+    #[test]
+    fn preflight_applies_configured_headers_without_client_headers() {
+        let request = Request::builder()
+            .header(http::header::HOST, "public.example")
+            .header(http::header::ORIGIN, "https://frontend.example")
+            .header(http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(http::header::COOKIE, "session=secret")
+            .header(http::header::AUTHORIZATION, "Bearer client-secret")
+            .header("x-client-only", "client-secret")
+            .finish();
+
+        for host_key in ["Host", "host", "HOST"] {
+            let mut options = make_options("http://10.10.12.1:80");
+            options.headers = Some(std::collections::HashMap::from([
+                (host_key.to_string(), "backend.example:80".to_string()),
+                (
+                    "Authorization".to_string(),
+                    "Bearer target-secret".to_string(),
+                ),
+                ("Cookie".to_string(), "session=target-secret".to_string()),
+                ("X-Api-Key".to_string(), "target-secret".to_string()),
+                ("X-Warpgate-Username".to_string(), "admin".to_string()),
+                ("Origin".to_string(), "https://wrong.example".to_string()),
+            ]));
+
+            let upstream = rewrite_request(
+                reqwest::Client::new()
+                    .request(http::Method::OPTIONS, &options.url)
+                    .headers(cors_preflight_request_headers(&request)),
+                &options,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            let headers = upstream.headers();
+            assert_eq!(headers[http::header::HOST], "backend.example:80");
+            assert_eq!(headers[http::header::ORIGIN], "https://wrong.example");
+            assert_eq!(headers[http::header::ACCESS_CONTROL_REQUEST_METHOD], "POST");
+            assert_eq!(headers[http::header::AUTHORIZATION], "Bearer target-secret");
+            assert_eq!(headers[http::header::COOKIE], "session=target-secret");
+            assert_eq!(headers["x-api-key"], "target-secret");
+            assert_eq!(headers["x-warpgate-username"], "admin");
+            assert!(!headers.contains_key("x-client-only"));
+        }
+    }
+
+    #[test]
+    fn preflight_does_not_copy_incoming_host_without_configured_override() {
+        let request = Request::builder()
+            .header(http::header::HOST, "public.example")
+            .finish();
+        let options = make_options("http://10.10.12.1:80");
+
+        let headers = cors_preflight_request_headers(&request);
+        assert!(!headers.contains_key(http::header::HOST));
     }
 
     #[tokio::test]

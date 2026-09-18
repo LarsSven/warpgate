@@ -93,6 +93,7 @@ pub struct TargetHTTPOptions {
 
     /// Forward unauthenticated browser CORS preflight requests to this target.
     /// Requires `external_host`; the target remains responsible for its CORS policy.
+    /// Configured target headers, including credentials, are sent on these requests.
     #[serde(default)]
     #[oai(default)]
     pub forward_cors_preflight: bool,
